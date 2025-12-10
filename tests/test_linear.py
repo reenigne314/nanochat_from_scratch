@@ -1,6 +1,33 @@
 import torch
 import torch.nn as nn
 
+print("CUDA available:", torch.cuda.is_available())
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print("Using device:", device)
+
+print("Testing basic GPU operations...")
+
+# Test 1: Simple tensor operations
+x = torch.randn(100, 100, device=device)
+y = torch.randn(100, 100, device=device)
+z = x @ y
+print(f"Simple matmul OK: {z.shape}")
+
+# Test 2: Embedding layer (part of your model)
+emb = torch.nn.Embedding(10000, 256, device=device)
+ids = torch.randint(0, 10000, (10, 32), device=device)
+out = emb(ids)
+print(f"Embedding layer OK: {out.shape}")
+
+'''# Test 3: Attention block components
+linear = torch.nn.Linear(256, 256, bias=False).to('cuda')
+attn = linear(out)
+print(f"Linear layer OK: {attn.shape}")'''
+
+print("All basic GPU tests passed!")
+
+
+'''
 # Create a linear layer: 3 input features -> 2 output features
 linear_layer = nn.Linear(3, 2, bias=True)
 
@@ -25,4 +52,4 @@ print("Output:", y)
 # Manually compute one output:
 # For first sample: y₁ = [1,2,3]·Wᵀ + b
 # = [1*w₁₁ + 2*w₁₂ + 3*w₁₃ + b₁, 
-#    1*w₂₁ + 2*w₂₂ + 3*w₂₃ + b₂]
+#    1*w₂₁ + 2*w₂₂ + 3*w₂₃ + b₂]'''

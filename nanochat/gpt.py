@@ -51,8 +51,8 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_heads
         assert self.n_embd % self.n_heads == 0
-        assert self.n_kv_head <= self.n_heads and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        assert self.n_kv_head <= self.n_heads and self.n_heads % self.n_kv_head == 0
+        self.c_q = nn.Linear(self.n_embd, self.n_heads * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
@@ -100,3 +100,121 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y            
+    
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square()  # ReLU^2 activation
+        x = self.c_proj(x)
+        return x
+        
+class Block(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.attn = CausalSelfAttention(config, layer_idx)
+        self.mlp = MLP(config)
+
+    def forward(self, x, cos_sin, kv_cache):
+        x = x + self.attn(norm(x), cos_sin, kv_cache)
+        x = x + self.mlp(norm(x))
+        return x
+    
+class GPT(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.transformer = nn.ModuleDict({
+            "wte": nn.Embedding(config.vocab_size, config.n_embd),
+            "h": nn.ModuleList([Block(config, layer_idx=i) for i in range(config.n_layers)]),
+        })
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # to support meta device initialization
+        # Black box yet to understand why
+        self.rotary_seq_len = config.sequence_length * 10 # 10X over-compute should be enough, TODO make nicer?
+        head_dim = config.n_embd // config.n_heads
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
+        self.register_buffer("sin", sin, persistent=False)
+
+    def init_weights(self):
+        self.apply(self._init_weights)
+        # Zero out lm_head weights as in GPT-2
+        torch.nn.init.zeros_(self.lm_head.weight)
+        # zer out c_proj weights in each attention layer
+        for block in self.transformer.h:
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.zeros_(block.attn.c_proj.weight)
+        # init rotary embeddings again to make sure
+        head_dim = self.config.n_embd // self.config.n_heads
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.cos, self.sin = cos, sin
+        # cast the embeddings to the same dtype as bf16 as it saves memory
+        if self.transformer.wte.weight.device.type == 'cuda':
+            self.transformer.wte.weight.to(dtype=torch.bfloat16)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # https://arxiv.org/pdf/2310.17813
+            fan_out = module.weight.size(0)
+            fan_in = module.weight.size(1)
+            std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
+
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
+        # autodetect device from model parameters
+        if device is None:
+            device = self.transformer.wte.weight.device
+        # stride the channels
+        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (base ** (channel_range / head_dim))
+        # calculate the position indices
+        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        #calculate the position angles
+        freqs = torch.outer(t, inv_freq)
+        cos, sin = torch.cos(freqs), torch.sin(freqs)
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]  # (1, seq_len, 1, head_dim/2)
+        return cos, sin
+    
+    def get_device(self):
+        return self.transformer.wte.weight.device
+    
+    def forward(self, idx, targets = None, kv_cache=None, loss_reduction='mean'):
+        B, T = idx.size()
+        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+        assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"        
+        # if kv cache exists 
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]  # (1, T, 1, head_dim/2)
+
+        # Token embeddings
+        x = self.transformer.wte(idx)  # (B, T, C)
+        x = norm(x)  # norm after token embedding
+        for block in self.transformer.h:
+            x = block(x, cos_sin, kv_cache)
+        x = norm(x)
+
+        # Forward the lm_head (compute logits)
+        softcap = 15
+        if targets is not None:
+            # training mode: compute and return the loss
+            # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
+            logits = self.lm_head(x)
+            logits = softcap * torch.tanh(logits / softcap) # logits softcap
+            logits = logits.float() # use tf32/fp32 for logits
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            return loss
+        else:
+            # inference mode: compute and return the logits
+            logits = self.lm_head(x)
+            logits = softcap * torch.tanh(logits / softcap) # logits softcap
+            return logits

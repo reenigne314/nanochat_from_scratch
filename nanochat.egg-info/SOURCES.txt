@@ -1,0 +1,14 @@
+LICENSE
+README.md
+setup.py
+nanochat/__init__.py
+nanochat/gpt.py
+nanochat.egg-info/PKG-INFO
+nanochat.egg-info/SOURCES.txt
+nanochat.egg-info/dependency_links.txt
+nanochat.egg-info/top_level.txt
+tests/__init__.py
+tests/rot_emb_test.py
+tests/test_gpt.py
+tests/test_linear.py
+tests/test_view.py

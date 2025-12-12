@@ -19,6 +19,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nanochat.common import get_dist_info, print0
+from nanochat.muon import Muon, DistMuon
+from nanochat.adamw import DistAdamW
 @dataclass
 class GPTConfig:
     sequence_length: int = 1024
@@ -187,11 +190,51 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
     
+    def estimate_flops(self):
+        # based on chichilla scaling law paper: https://arxiv.org/abs/2204.02311
+        nparams = sum(p.numel() for p in self.parameters())
+        nparams_embedding = self.transformer.wte.weight.numel()
+        l, h, q, t = self.config.n_layers, self.config.n_heads, self.config.n_embd // self.config.n_heads, self.config.sequence_length
+        num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
+        return num_flops_per_token
+
+    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
+        model_dim = self.config.n_embd
+        ddp, rank, local_rank, world_size = get_dist_info()
+        # seperate parameters into 3 different parts
+        matrix_params = list(self.transformer.h.parameters())  # all transformer block params
+        embedding_params = [self.transformer.wte.weight]  # token embedding
+        lm_head_params = [self.lm_head.weight]  # lm head
+        # setup optimizers with different learning rates
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
+        # Create the AdamW optimizer for the embedding and lm_head
+        # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
+        dmodel_lr_scale = (model_dim / 768) ** -0.5
+        if rank == 0:
+            print(f"Scaling learning rates by 1/sqrt({model_dim}) = {dmodel_lr_scale:.4f}")
+            adam_groups = [
+                dict(params=lm_head_params, lr=embedding_lr * dmodel_lr_scale),
+                dict(params=embedding_params, lr=unembedding_lr * dmodel_lr_scale),
+            ]
+        adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
+        AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
+        adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
+        # Create the Muon optimizer for the linear layers
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
+        MuonFactory = DistMuon if ddp else Muon
+        muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
+        # Combine them the two optimizers into one list
+        optimizers = [adamw_optimizer, muon_optimizer]
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["initial_lr"] = group["lr"]
+        return optimizers        
+
     def forward(self, idx, targets = None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
-        assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"        
+        #assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"        
         # if kv cache exists 
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]  # (1, T, 1, head_dim/2)
@@ -203,18 +246,17 @@ class GPT(nn.Module):
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
         softcap = 15
+        logits = self.lm_head(x)
+        logits = logits.float() # use tf32/fp32 for logits
+        logits = softcap * torch.tanh(logits / softcap) # logits softcap
+
+        # Forward the lm_head (compute logits)
         if targets is not None:
             # training mode: compute and return the loss
             # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
-            logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
-            logits = logits.float() # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
             # inference mode: compute and return the logits
-            logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
             return logits

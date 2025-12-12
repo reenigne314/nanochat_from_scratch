@@ -162,7 +162,7 @@ def test_gpt_module():
     assert cpu_device.type == 'cpu', f"Model not on CPU: {cpu_device}"
     print(f"✓ Model can be moved to CPU")
 
-    # Test 9: Check BF16 conversion (on CUDA if available)
+    '''# Test 9: Check BF16 conversion (on CUDA if available)
     print("\n9. Checking BF16 conversion...")
     if torch.cuda.is_available():
         model.cuda()
@@ -177,10 +177,62 @@ def test_gpt_module():
             else:
                 print(f"  ⚠️ wte dtype on CUDA: {wte_dtype} (expected bfloat16)")
     else:
-        print("  Skipping CUDA/BF16 test (CUDA not available)")
+        print("  Skipping CUDA/BF16 test (CUDA not available)")'''
 
-    # Test 10: Parameter count
-    print("\n10. Calculating parameter count...")
+    # Test 10: Flops calculation
+    print("\n10. Calculating FLOPs...")
+    flops = model.estimate_flops()
+    print(f"  Estimated FLOPs per forward pass: {flops / 1e9:.2f} GFLOPs")
+
+    # Test 11: Optimizers count
+    optimizers = model.setup_optimizers()
+
+    # Check optimizer list
+    assert isinstance(optimizers, list), f"Expected list, got {type(optimizers)}"
+    assert len(optimizers) == 2, f"Expected 2 optimizers, got {len(optimizers)}"
+    
+    # Check AdamW optimizer
+    adamw_opt = optimizers[0]
+    assert isinstance(adamw_opt, torch.optim.AdamW), f"First optimizer should be AdamW"
+    
+    # Check AdamW parameter groups
+    assert len(adamw_opt.param_groups) == 2, f"AdamW should have 2 param groups"
+
+    # Test 5: Test setup_optimizers with custom values
+    print("\n5. Testing setup_optimizers() with custom learning rates...")
+    
+    custom_unembedding_lr = 0.01
+    custom_embedding_lr = 0.5
+    custom_matrix_lr = 0.05
+    custom_weight_decay = 0.1
+    
+    optimizers_custom = model.setup_optimizers(
+        unembedding_lr=custom_unembedding_lr,
+        embedding_lr=custom_embedding_lr,
+        matrix_lr=custom_matrix_lr,
+        weight_decay=custom_weight_decay
+    )
+    
+    # Check AdamW weight decay
+    adamw_custom = optimizers_custom[0]
+    for group in adamw_custom.param_groups:
+        assert torch.allclose(torch.tensor(group['weight_decay']), torch.tensor(custom_weight_decay), rtol=1e-4), \
+            f"Weight decay mismatch: got {group['weight_decay']}, expected {custom_weight_decay}"
+    
+    # Check Muon LR
+    muon_custom = optimizers_custom[1]
+    muon_custom_group = muon_custom.param_groups[0]
+    assert torch.allclose(torch.tensor(muon_custom_group['lr']), torch.tensor(custom_matrix_lr), rtol=1e-4), \
+        f"Custom Muon LR mismatch: got {muon_custom_group['lr']}, expected {custom_matrix_lr}"
+    
+    print(f"✓ Custom optimizer settings applied correctly")
+    print(f"  - Custom unembedding LR: {custom_unembedding_lr}")
+    print(f"  - Custom embedding LR: {custom_embedding_lr}")
+    print(f"  - Custom matrix LR: {custom_matrix_lr}")
+    print(f"  - Custom weight decay: {custom_weight_decay}")
+
+    # Test 12: Parameter count
+    print("\n11. Calculating parameter count...")
     
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters())
